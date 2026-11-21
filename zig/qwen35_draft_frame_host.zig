@@ -395,3 +395,154 @@ test "Draft frames: an EXL3 head's span views plan their K split as the whole he
         try std.testing.expect(F.x3_tail_at <= 248032 and F.x3_tail_at + v.tail.n == w.n);
     }
 }
+
+test "Qwen CUDA contracts: mixed-width heads launch by class and restore stream rows" {
+    for ([_]usize{ 8, 16 }) |block| {
+        try mixedHeadContract(block, false);
+        try mixedHeadContract(block, true);
+    }
+}
+
+fn mixedHeadContract(block: usize, wide_even: bool) !void {
+    const Trace = struct {
+        const Copy = struct { dst: u64, src: u64, bytes: usize };
+        var gathered: [5]Copy = undefined;
+        var fetched: [5]Copy = undefined;
+        var np: usize = 0;
+        var nf: usize = 0;
+        var heads: [2]struct { columns: u32, rows: u32 } = undefined;
+        var nh: usize = 0;
+        var copies2d: usize = 0;
+        fn launch(f: cuda.abi.Function, _: c_uint, gy: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            if (@intFromPtr(f) == 1) {
+                heads[nh] = .{ .columns = @as(*const u32, @ptrCast(@alignCast(args.?[1].?))).*, .rows = gy };
+                nh += 1;
+            }
+            return cuda.abi.success;
+        }
+        fn copyDevice(dst: u64, src: u64, bytes: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            gathered[np] = .{ .dst = dst, .src = src, .bytes = bytes };
+            np += 1;
+            return cuda.abi.success;
+        }
+        fn copyHost(dst: ?*anyopaque, src: u64, bytes: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            fetched[nf] = .{ .dst = @intFromPtr(dst.?), .src = src, .bytes = bytes };
+            nf += 1;
+            return cuda.abi.success;
+        }
+        fn copy2d(_: *const cuda.abi.Memcpy2D, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            copies2d += 1;
+            return cuda.abi.success;
+        }
+    };
+    var driver: cuda.Driver = undefined;
+    driver.api.cuLaunchKernel = Trace.launch;
+    driver.api.cuMemcpyDtoDAsync_v2 = Trace.copyDevice;
+    driver.api.cuMemcpyDtoHAsync_v2 = Trace.copyHost;
+    driver.api.cuMemcpy2DAsync_v2 = Trace.copy2d;
+    var e: q.engine.Engine = undefined;
+    e.d = &driver;
+    e.stream = .{ .d = &driver, .handle = null };
+    e.kit = null;
+    e.affine.split = null;
+    e.affine.mlp128 = false;
+    e.affine.pdl = false;
+    e.affine.wide_verify = false;
+    e.affine.group_fn = function(&driver, 4);
+    e.fns.sums = function(&driver, 3);
+    e.draws.topk_slices_fn = function(&driver, 1);
+    e.draws.topk_merge_fn = function(&driver, 2);
+    var head = weight();
+    head.n = 248320;
+    head.npad = head.n;
+    e.head = .{ .a4 = head };
+    var d: q.draft.Draft = undefined;
+    d.e = &e;
+    d.c = config();
+    d.c.block = block;
+    d.c.vocab = 248320;
+    d.x = 0x100000;
+    d.h2 = 0x200000;
+    d.logits = 0x300000;
+    d.xs = 0x400000;
+    d.words = 0x500000;
+    d.parts = 0x600000;
+    var contexts: [5]q.draft.Ctx = undefined;
+    var refs: [5]*q.draft.Ctx = undefined;
+    for (&contexts, &refs, 0..) |*ctx, *ref, i| {
+        ctx.* = .{ .ring = undefined, .wide = if (wide_even) i % 2 == 0 else i % 2 == 1 };
+        ref.* = ctx;
+    }
+    var storage: [q.draft.frame.stagedLen(2)]u8 align(8) = undefined;
+    Trace.np = 0;
+    Trace.nf = 0;
+    Trace.nh = 0;
+    Trace.copies2d = 0;
+    try std.testing.expect(q.draft.frame.mixedHeadEligible(e.head, &refs));
+    const all_rows = contexts.len * (d.c.block - 1);
+    const baseline = try q.draft.frame.logitsOf(&d, &refs, d.x, d.logits, all_rows);
+    try std.testing.expect(baseline == null);
+    try e.draws.topkRows(e.stream, baseline orelse d.logits, q.draft.frame.columns(baseline != null, d.c.vocab), @intCast(d.c.topk), d.parts, d.words, all_rows);
+    try std.testing.expectEqual(@as(usize, 1), Trace.nh);
+    try std.testing.expectEqual(@as(u32, 248320), Trace.heads[0].columns);
+    try std.testing.expectEqual(@as(u32, @intCast(all_rows)), Trace.heads[0].rows);
+    Trace.nh = 0;
+    try q.draft.frame.mixedHead(&d, &refs, &storage);
+    try std.testing.expectEqual(@as(usize, 5), Trace.np);
+    try std.testing.expectEqual(@as(usize, 5), Trace.nf);
+    try std.testing.expectEqual(@as(usize, 2), Trace.nh);
+    try std.testing.expectEqual(@as(usize, 2), Trace.copies2d);
+    const narrow_count: usize = if (wide_even) 2 else 3;
+    const wide_count = contexts.len - narrow_count;
+    const per = d.c.block - 1;
+    try std.testing.expectEqual(@as(u32, 98592), Trace.heads[0].columns);
+    try std.testing.expectEqual(@as(u32, @intCast(narrow_count * per)), Trace.heads[0].rows);
+    try std.testing.expectEqual(@as(u32, 248320), Trace.heads[1].columns);
+    try std.testing.expectEqual(@as(u32, @intCast(wide_count * per)), Trace.heads[1].rows);
+    const input_bytes = per * 256 * 2;
+    const word_bytes = per * 43 * 4;
+    const order = if (wide_even) [_]usize{ 1, 3, 0, 2, 4 } else [_]usize{ 0, 2, 4, 1, 3 };
+    for (order, 0..) |original, i| {
+        const group_index = if (i < narrow_count) i else i - narrow_count;
+        try std.testing.expectEqual(d.x + original * input_bytes, Trace.gathered[i].src);
+        try std.testing.expectEqual(d.h2 + group_index * input_bytes, Trace.gathered[i].dst);
+        try std.testing.expectEqual(@as(usize, input_bytes), Trace.gathered[i].bytes);
+        try std.testing.expectEqual(d.words + group_index * word_bytes, Trace.fetched[i].src);
+        try std.testing.expectEqual(@intFromPtr(&storage) + q.draft.frame.words_at + original * word_bytes, Trace.fetched[i].dst);
+        try std.testing.expectEqual(@as(usize, word_bytes), Trace.fetched[i].bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 98592), q.draft.frame.columns(true, 248320));
+    try std.testing.expectEqual(@as(usize, 248320), q.draft.frame.columns(false, 248320));
+    try std.testing.expectEqual(@as(u32, 248032), q.draft.frame.columnId(98304));
+    try std.testing.expectEqual(@as(u32, 248319), q.draft.frame.columnId(98591));
+}
+
+test "Qwen CUDA contracts: mixed-width eligibility covers A4 and EXL3, not homogeneous batches" {
+    var narrow: q.draft.Ctx = .{ .ring = undefined };
+    var wide: q.draft.Ctx = .{ .ring = undefined, .wide = true };
+    var refs = [_]*q.draft.Ctx{ &narrow, &wide };
+    var e: q.engine.Engine = undefined;
+    var a4 = weight();
+    a4.n = 248320;
+    a4.npad = a4.n;
+    e.head = .{ .a4 = a4 };
+    try std.testing.expect(q.draft.frame.mixedHeadEligible(e.head, &refs));
+    wide.wide = false;
+    try std.testing.expect(!q.draft.frame.mixedHeadEligible(e.head, &refs));
+    narrow.wide = true;
+    wide.wide = true;
+    try std.testing.expect(!q.draft.frame.mixedHeadEligible(e.head, &refs));
+
+    narrow.wide = false;
+    wide.wide = true;
+    const x3 = cuda.exl3;
+    const st = x3.strides(5120, 248320, 12, false);
+    const x3_head: x3.Weight = .{ .trellis = 0x1000, .suh = 0x2000, .svh = 0x3000, .k = 5120, .n = 248320, .halves = 12, .codebook = .mul1, .stride_k = st.k, .stride_nb = st.nb };
+    e.head = .{ .x3 = x3_head };
+    try std.testing.expect(q.draft.frame.mixedHeadEligible(e.head, &refs));
+    wide.wide = false;
+    try std.testing.expect(!q.draft.frame.mixedHeadEligible(e.head, &refs));
+    narrow.wide = true;
+    wide.wide = true;
+    try std.testing.expect(!q.draft.frame.mixedHeadEligible(e.head, &refs));
+}
